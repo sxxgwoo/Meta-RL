@@ -11,7 +11,8 @@ from agent import DynaMITEAgent
 
 from torch.utils.tensorboard import SummaryWriter
 '''
-nohup python main.py > train_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+nohup python -u main.py > train_$(date +"%Y%m%d_%H%M%S").log 2>&1 &
+tensorboard --logdir logs --port 6006
 
 '''
 

@@ -37,59 +37,157 @@ class DynaMITEAgent:
 
         B, T, _ = states.shape
 
+        # term / session_id는 모든 VAE epoch에서 공통으로 쓰이므로 미리 계산
+        term = terminations.squeeze(-1) * masks.squeeze(-1)  # (B, T)
+        session_id = torch.cumsum(term, dim=1).long()        # (B, T)
+
+        # ---------------------------------------------
+        # 1. Train VAE (Inference Model) - Multi Epoch
+        #    (같은 batch로 vae_epochs번 업데이트)
+        # ---------------------------------------------
+        last_vae_loss_value = None
+
+        for _ in range(self.cfg.vae_epochs):  # ### [변경] 여러 epoch
+            mu, logvar, term_logits, _ = self.vae.encode(states, prev_actions, rewards)
+            z = self.vae.reparameterize(mu, logvar)
+
+            # --------------------------------------
+            # A. Session-based Reconstruction Mask
+            # --------------------------------------
+            same_session = (session_id.unsqueeze(2) == session_id.unsqueeze(1))  # (B, T, T)
+
+            valid = masks.squeeze(-1) > 0.5                      # (B, T)
+            pair_valid = (
+                valid.unsqueeze(2) &  # latent index i
+                valid.unsqueeze(1)    # target index j
+            )  # (B, T, T)
+
+            pair_mask = (same_session & pair_valid)              # (B, T, T), bool
+            pair_mask_f = pair_mask.to(states.dtype)
+
+            # z_i : (B, T, Dz) → (B, T, T, Dz)
+            z_pair = z.unsqueeze(2).expand(B, T, T, z.size(-1))
+            states_pair = states.unsqueeze(1).expand(B, T, T, states.size(-1))
+            actions_pair = actions.unsqueeze(1).expand(B, T, T, actions.size(-1))
+            rewards_pair = rewards.unsqueeze(1).expand(B, T, T, 1)
+
+            BT2 = B * T * T
+            states_flat = states_pair.reshape(BT2, -1)
+            actions_flat = actions_pair.reshape(BT2, -1)
+            z_flat = z_pair.reshape(BT2, -1)
+            rewards_flat = rewards_pair.reshape(BT2, 1)
+
+            pred_rewards_flat = self.vae.decode_reward(states_flat, actions_flat, z_flat)
+            loss_recon_flat = F.mse_loss(
+                pred_rewards_flat, rewards_flat, reduction="none"
+            ).reshape(B, T, T, 1)  # (B, T, T, 1)
+
+            loss_recon_pair = loss_recon_flat.squeeze(-1) * pair_mask_f  # (B, T, T)
+            denom_recon = pair_mask_f.sum().clamp_min(1.0)
+            loss_recon = loss_recon_pair.sum() / denom_recon
+
+            # --------------------------------------
+            # B. KL with latent belief conditioning
+            #    - t = 0: prior = N(0, I)
+            #    - t ≥ 1: prior = q_{t-1}
+            # --------------------------------------
+            mu_shift = torch.zeros_like(mu)
+            logvar_shift = torch.zeros_like(logvar)
+            mu_shift[:, 1:, :] = mu[:, :-1, :].detach()
+            logvar_shift[:, 1:, :] = logvar[:, :-1, :].detach()
+            # t=0 은 (0,0) → N(0,I) prior
+
+            prior_mu = mu_shift
+            prior_logvar = logvar_shift
+
+            var_q = logvar.exp()
+            var_p = prior_logvar.exp()  # t=0에서는 1, 그 외에는 이전 posterior 분산
+
+            kl_elements = prior_logvar - logvar \
+                          + (var_q + (mu - prior_mu) ** 2) / (var_p + 1e-8) \
+                          - 1.0
+            loss_kl_t = 0.5 * kl_elements.sum(-1)   # (B, T)
+            loss_kl = (loss_kl_t * masks.squeeze(-1)).mean()
+
+            # --------------------------------------
+            # C. Consistency Loss (논문식)
+            #    θ_t = KL(q_t || q_end(session))
+            #    L_cons = max(θ_{t+1} - θ_t, 0)
+            # --------------------------------------
+            session_last_idx = torch.zeros_like(session_id)  # (B, T)
+            session_last_idx[:, -1] = T - 1
+
+            for t in range(T - 2, -1, -1):
+                same_as_next = (session_id[:, t] == session_id[:, t + 1])
+                session_last_idx[:, t] = torch.where(
+                    same_as_next,
+                    session_last_idx[:, t + 1],
+                    torch.full_like(session_last_idx[:, t], t)
+                )
+
+            device = mu.device
+            batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, T)
+            mu_end = mu[batch_indices, session_last_idx]          # (B, T, D)
+            logvar_end = logvar[batch_indices, session_last_idx]  # (B, T, D)
+
+            var_end = logvar_end.exp()
+
+            theta_elements = logvar_end - logvar \
+                             + (logvar.exp() + (mu - mu_end) ** 2) / (var_end + 1e-8) \
+                             - 1.0
+            theta = 0.5 * theta_elements.sum(-1)  # (B, T)
+
+            theta_next = theta[:, 1:]      # (B, T-1)
+            theta_curr = theta[:, :-1]     # (B, T-1)
+            delta_theta = theta_next - theta_curr
+
+            same_session_next = (session_id[:, 1:] == session_id[:, :-1])  # (B, T-1)
+            valid_cons = same_session_next & (masks[:, 1:].squeeze(-1) > 0.5)
+            valid_cons_f = valid_cons.to(theta.dtype)
+
+            loss_consistency = (
+                F.relu(delta_theta) * valid_cons_f
+            ).sum() / valid_cons_f.sum().clamp_min(1.0)
+
+            # --------------------------------------
+            # D. Termination Loss (d_t)
+            # --------------------------------------
+            term_logits_flat = term_logits.squeeze(-1)      # (B, T)
+            d_t = terminations.squeeze(-1)                 # (B, T)
+            loss_term = F.binary_cross_entropy_with_logits(
+                term_logits_flat, d_t, reduction="none"
+            )
+            loss_term = (loss_term * masks.squeeze(-1)).mean()
+
+            # --------------------------------------
+            # 최종 VAE Loss
+            # --------------------------------------
+            loss_vae = (
+                loss_recon
+                + self.cfg.beta_consistency * loss_consistency
+                + 0.1 * loss_kl
+                + self.cfg.lambda_term * loss_term
+            )
+
+            self.opt_vae.zero_grad()
+            loss_vae.backward()
+            nn.utils.clip_grad_norm_(self.vae.parameters(), self.cfg.max_grad_norm)
+            self.opt_vae.step()
+
+            last_vae_loss_value = loss_vae.item()  # 로그용 값 갱신
+
         # ---------------------------------------------------
-        # 1. Train VAE (Inference Model) - One Pass per Iter
+        # 2. Train Policy (PPO)
+        #    - 업데이트된 VAE로 다시 z를 뽑아서 사용
         # ---------------------------------------------------
-        mu, logvar, term_logits, _ = self.vae.encode(states, prev_actions, rewards)
-        z = self.vae.reparameterize(mu, logvar)
+        with torch.no_grad():  # ### [변경] 최신 VAE로 latent 다시 계산
+            mu, logvar, _, _ = self.vae.encode(states, prev_actions, rewards)
+            z = self.vae.reparameterize(mu, logvar)
 
-        # A. Reconstruction Loss (reward reconstruction)
-        pred_rewards = self.vae.decode_reward(states, actions, z)
-        loss_recon = F.mse_loss(pred_rewards, rewards, reduction="none")  # (B, T, 1)
-        loss_recon = (loss_recon * masks).mean()
-
-        # B. KL Divergence w.r.t N(0, I)
-        loss_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)  # (B, T)
-        loss_kl = (loss_kl * masks.squeeze(-1)).mean()
-
-        # C. Consistency Loss (local consecutive KL)
-        dist_t = Normal(mu[:, :-1], torch.exp(0.5 * logvar[:, :-1]))
-        dist_t1 = Normal(mu[:, 1:], torch.exp(0.5 * logvar[:, 1:]))
-        kl_consecutive = kl_divergence(dist_t, dist_t1).sum(-1)  # (B, T-1)
-        loss_consistency = (
-            F.relu(kl_consecutive) * masks[:, :-1].squeeze(-1)
-        ).mean()
-
-        # D. Termination Loss (binary cross-entropy on d_t)
-        term_logits_flat = term_logits.squeeze(-1)      # (B, T)
-        d_t = terminations.squeeze(-1)                 # (B, T)
-        loss_term = F.binary_cross_entropy_with_logits(
-            term_logits_flat, d_t, reduction="none"
-        )
-        loss_term = (loss_term * masks.squeeze(-1)).mean()
-
-        # Final VAE Loss
-        loss_vae = (
-            loss_recon
-            + self.cfg.beta_consistency * loss_consistency
-            + 0.1 * loss_kl
-            + self.cfg.lambda_term * loss_term
-        )
-
-        self.opt_vae.zero_grad()
-        loss_vae.backward()
-        nn.utils.clip_grad_norm_(self.vae.parameters(), self.cfg.max_grad_norm)
-        self.opt_vae.step()
-
-        # ---------------------------------------------------
-        # 2. Train Policy (PPO) - Multiple Epochs
-        # ---------------------------------------------------
-        # Detach z for RL (Treat latent as fixed state feature for this update)
         z_detached = z.detach()
 
         # --- GAE 계산 ---
         with torch.no_grad():
-            # ActorCritic는 (N, obs_dim)를 기대하므로 flatten해서 value 계산
             flat_states_v = states.reshape(B * T, -1)
             flat_z_v = z_detached.reshape(B * T, -1)
             _, _, _, values_flat = self.actor_critic.get_action_and_value(
@@ -124,9 +222,7 @@ class DynaMITEAgent:
 
             returns = advantages + values  # (B, T, 1)
 
-            # Advantage Normalization
             advantages_flat = advantages.view(-1)
-            # 마스크된 부분만 사용해서 평균/표준편차 계산
             valid_mask_flat = masks.view(-1) > 0.5
             valid_adv = advantages_flat[valid_mask_flat]
             norm_adv = (valid_adv - valid_adv.mean()) / (valid_adv.std() + 1e-8)
@@ -141,9 +237,8 @@ class DynaMITEAgent:
         flat_log_probs = old_log_probs_all.reshape(B * T)
         flat_advantages = advantages.reshape(B * T)
         flat_returns = returns.reshape(B * T)
-        flat_masks = masks.reshape(B * T)  # (B*T,1) → (B*T,)
+        flat_masks = masks.reshape(B * T)
 
-        # padding / invalid timestep 제거
         valid = flat_masks > 0.5
         flat_states = flat_states[valid]
         flat_z = flat_z[valid]
@@ -170,14 +265,12 @@ class DynaMITEAgent:
                 mb_advantages = flat_advantages[mb_idx]
                 mb_returns = flat_returns[mb_idx]
 
-                # 현재 policy 평가
                 action_idx = mb_actions.argmax(-1)  # (mb,)
                 _, new_log_probs, entropy, new_values = self.actor_critic.get_action_and_value(
                     mb_states, mb_z, action=action_idx
                 )
                 new_values = new_values.squeeze(-1)  # (mb,)
 
-                # PPO ratio & surrogate
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(
@@ -202,7 +295,7 @@ class DynaMITEAgent:
                 self.opt_rl.step()
 
         return {
-            "loss_vae": loss_vae.item(),
+            "loss_vae": last_vae_loss_value if last_vae_loss_value is not None else 0.0,
             "loss_rl": loss_rl.item(),
             "reward": rewards.sum().item(),
         }
