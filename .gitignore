@@ -1,3 +1,4 @@
 checkpoints/
 checkpoints_hlt/
 *.log
+logs/
