@@ -2,3 +2,5 @@ checkpoints/
 checkpoints_hlt/
 *.log
 logs/
+evaluate_vae.py
+graph/
