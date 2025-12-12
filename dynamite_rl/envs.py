@@ -43,6 +43,20 @@ class GridWorldAlternate(gym.Env):
             self.goals[1]
         ]) / (self.grid_size - 1)
         return obs.astype(np.float32)
+    
+    def _sample_non_goal_position(self):
+        """현재 goals를 기준으로 goal이 아닌 랜덤 위치 하나 샘플."""
+        assert self.goals is not None, "goals must be set before sampling start position."
+        positions = [
+            (i, j)
+            for i in range(self.grid_size)
+            for j in range(self.grid_size)
+            if not np.array_equal([i, j], self.goals[0])
+            and not np.array_equal([i, j], self.goals[1])
+        ]
+        positions = np.array(positions)
+        idx = self.np_random.integers(len(positions))
+        return positions[idx].astype(int)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -55,7 +69,7 @@ class GridWorldAlternate(gym.Env):
         # Sample two goal positions (never equal to each other or to start)
         possible_positions = np.array([
             (i, j) for i in range(self.grid_size) for j in range(self.grid_size)
-            if not (i == 0 and j == 0)  # cannot be start
+            # if not (i == 0 and j == 0)  # cannot be start
         ])
         selected = possible_positions[rng.choice(len(possible_positions), 2, replace=False)]
 
@@ -63,6 +77,8 @@ class GridWorldAlternate(gym.Env):
             selected[0].astype(int),
             selected[1].astype(int)
         ]
+        # 2) 시작 위치는 goal이 아닌 칸 중 하나에서 샘플
+        self.agent_pos = self._sample_non_goal_position()
 
         # Choose initial rewarding goal index
         self.active_goal_idx = rng.integers(0, 2)
@@ -111,7 +127,10 @@ class GridWorldAlternate(gym.Env):
 
             # *** IMPORTANT ***
             # Return agent to start position (0,0)
-            self.agent_pos = np.array([0, 0], dtype=int)
+            # self.agent_pos = np.array([0, 0], dtype=int)
+            
+            # 새 세션 시작 위치: goal이 아닌 칸에서 랜덤
+            self.agent_pos = self._sample_non_goal_position()
 
         terminated = False
         truncated = self.steps >= self.max_steps

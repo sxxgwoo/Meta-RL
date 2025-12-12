@@ -10,7 +10,7 @@ from agent import DynaMITEAgent
 
 # ==========================================
 # [설정] 불러올 체크포인트 경로
-CHECKPOINT_PATH = "checkpoints/run_2025-12-11_09-01-33/best_model.pt"
+CHECKPOINT_PATH = "checkpoints/run_2025-12-11_16-08-40/best_model.pt"
 NUM_EPISODES_TO_WATCH = 1
 SLEEP_TIME = 0.3  # 각 스텝마다 대기할 시간 (초)
 # ==========================================
